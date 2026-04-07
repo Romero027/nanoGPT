@@ -179,6 +179,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    # Forward pass
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
@@ -191,15 +192,25 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb) # (B, T, C)
         for block in self.transformer.h:
             x = block(x)                    # (B, T, C) -> (B, T, C), repeated n_layer times
+        
+        # Up to this point, we have B sequences of length T, each with a C-dimensional embedding. These are the final contextualized token representations.
+        # Each token vector now contains information about:
+        # - the token itself
+        # - its position
+        # - the earlier context it attended to
+        
+        # Final layer normalization
         x = self.transformer.ln_f(x)        # (B, T, C) -> (B, T, C)
-
+        
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)         # (B, T, C) -> (B, T, V)
+            # Recall that the lm_head is a linear layer that projects the token embeddings into the vocabulary space.
+            logits = self.lm_head(x)         # (B, T, C) -> (B, T, V) where V is the vocabulary size
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # (B, 1, C) -> (B, 1, V)
+            # The model is autoregressive, so we only need to predict the next token.
+            logits = self.lm_head(x[:, [-1], :]) # (B, 1, C) -> (B, 1, V) 
             loss = None
 
         return logits, loss
