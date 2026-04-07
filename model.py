@@ -24,6 +24,7 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
+        # input: (B, T, C) -> output: (B, T, C)  — normalizes along the last dimension
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class CausalSelfAttention(nn.Module):
@@ -50,10 +51,13 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
+        # x: (B, T, C) -> output: (B, T, C)
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # c_attn: (B, T, C) -> (B, T, 3C), then split into 3 x (B, T, C)
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # reshape + transpose: (B, T, C) -> (B, T, nh, hs) -> (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -61,17 +65,19 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
+            # y: (B, nh, T, hs)
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))  # (B, nh, T, T)
+            att = F.softmax(att, dim=-1)                                     # (B, nh, T, T)
+            att = self.attn_dropout(att)                                     # (B, nh, T, T)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # (B, nh, T, hs) -> (B, T, nh, hs) -> (B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # output projection
+        # output projection: (B, T, C) -> (B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -85,24 +91,29 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
+        # x: (B, T, C) -> output: (B, T, C)
+        x = self.c_fc(x)    # (B, T, C) -> (B, T, 4C)
+        x = self.gelu(x)    # (B, T, 4C) -> (B, T, 4C)
+        x = self.c_proj(x)  # (B, T, 4C) -> (B, T, C)
+        x = self.dropout(x) # (B, T, C)  -> (B, T, C)
         return x
 
 class Block(nn.Module):
+    """Very Important: A single Transformer block using pre-norm architecture (GPT-2 style)."""
 
     def __init__(self, config):
         super().__init__()
+        # Pre-norm: LayerNorm is applied before attention/MLP, not after (differs from original Transformer)
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        # x: (B, T, C) -> output: (B, T, C)
+        # Residual connections around both sub-layers for stable gradient flow
+        x = x + self.attn(self.ln_1(x))  # (B, T, C) -> LN -> attn -> (B, T, C), then add residual
+        x = x + self.mlp(self.ln_2(x))   # (B, T, C) -> LN -> MLP -> (B, T, C), then add residual
         return x
 
 @dataclass
@@ -174,20 +185,20 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        tok_emb = self.transformer.wte(idx) # (B, T) -> (B, T, C)
+        pos_emb = self.transformer.wpe(pos) # (T,)   -> (T, C), broadcast to (B, T, C)
+        x = self.transformer.drop(tok_emb + pos_emb) # (B, T, C)
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+            x = block(x)                    # (B, T, C) -> (B, T, C), repeated n_layer times
+        x = self.transformer.ln_f(x)        # (B, T, C) -> (B, T, C)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = self.lm_head(x)         # (B, T, C) -> (B, T, V)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :]) # (B, 1, C) -> (B, 1, V)
             loss = None
 
         return logits, loss
