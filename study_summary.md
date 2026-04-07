@@ -80,10 +80,11 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
+        # x: (B, T, C) -> output: (B, T, C)
+        x = self.c_fc(x)    # (B, T, C) -> (B, T, 4C)  — expand into a richer feature space
+        x = self.gelu(x)    # (B, T, 4C) -> (B, T, 4C) — introduce nonlinearity (let the network learn non-linear patterns)
+        x = self.c_proj(x)  # (B, T, 4C) -> (B, T, C)  — compress back, keeping only the useful signal
+        x = self.dropout(x) # (B, T, C)  -> (B, T, C)  — randomly zero activations to prevent overfitting
         return x
 ```
 
@@ -104,6 +105,8 @@ A two-layer feed-forward network applied to each token position independently:
 
 ### 1.4 Residual Connections
 
+A residual connection lets each layer learn a small correction to the current representation instead of rebuilding it from scratch. 
+
 Look again at `Block.forward`:
 
 ```python
@@ -112,6 +115,7 @@ x = x + self.mlp(self.ln_2(x))    # residual around MLP
 ```
 
 The pattern is `x = x + sublayer(norm(x))`. The input `x` is added back to the output of each sublayer. This creates a "gradient highway" — during backprop, gradients can flow directly through the `+ x` path without being attenuated by the sublayer's weights.
+This allows the layer to learn a residual function (a correction to the input) rather than a full transformation, which improves gradient flow and enables training very deep networks.
 
 **Key questions to answer:**
 
@@ -122,18 +126,20 @@ The pattern is `x = x + sublayer(norm(x))`. The input `x` is added back to the o
 
 ```python
 self.transformer = nn.ModuleDict(dict(
-    wte = nn.Embedding(config.vocab_size, config.n_embd),
-    wpe = nn.Embedding(config.block_size, config.n_embd),
-    drop = nn.Dropout(config.dropout),
-    h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-    ln_f = LayerNorm(config.n_embd, bias=config.bias),
+    wte = nn.Embedding(config.vocab_size, config.n_embd),  # token embeddings (maps each token ID to a learned vector.)
+    wpe = nn.Embedding(config.block_size, config.n_embd), # position embeddings (add a learned embedding for each position)
+    drop = nn.Dropout(config.dropout), # dropout (prevent the model from overfitting to specific token-position patterns)
+    h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # many transformer blocks
+    ln_f = LayerNorm(config.n_embd, bias=config.bias), # final layernorm
 ))
+# The final output projection - take each final hidden vector of size n_embd and turn it into a score for every token in the vocabulary
+self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 ```
 
 The forward pass (lines 170–193) shows the full pipeline:
 
 ```
-tokens (B,T) → tok_emb + pos_emb → dropout → [Block × 12] → final LayerNorm → lm_head → logits
+tokens (B,T) → tok_emb + pos_emb → dropout → [Attention Block × 12] → final LayerNorm → lm_head → logits
 ```
 
 Note the **weight tying** at line 138: `self.transformer.wte.weight = self.lm_head.weight` — the input embedding and output projection share the same weight matrix.
@@ -172,7 +178,7 @@ q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 | Fused projection | `self.c_attn(x)` | `(B, T, 768)` → `(B, T, 2304)` |
 | Split | `.split(768, dim=2)` | 3 tensors, each `(B, T, 768)` |
 
-This is a performance optimization — one big matmul instead of three separate ones for Q, K, V.
+This is a performance optimization — one big matmul instead of three separate ones for Q, K, V. This yields better GPU efficiency and simpler implementation.
 
 ### 2.3 Head Split (Reshape + Transpose)
 
@@ -188,7 +194,7 @@ Each of Q, K, V goes through:
 |------|-----------|-------|
 | Start | `q` after split | `(B, T, 768)` |
 | View | `.view(B, T, 12, 64)` | `(B, T, 12, 64)` — expose the 12 heads |
-| Transpose | `.transpose(1, 2)` | `(B, 12, T, 64)` — heads become a batch dim |
+| Transpose | `.transpose(1, 2)` | `(B, 12, T, 64)` — heads become a batch dim (transpose swap dimension 1 and 2) |
 
 After this, each of q, k, v has shape **`(B, 12, T, 64)`** — each head independently attends over the sequence with 64-dimensional keys/queries/values.
 
@@ -208,12 +214,12 @@ Traced step by step:
 
 | Step | Expression | Shape | Notes |
 |------|-----------|-------|-------|
-| **QKᵀ** | `q @ k.transpose(-2,-1)` | `(B,12,T,64) @ (B,12,64,T)` = `(B,12,T,T)` | Raw attention scores |
-| **Scale** | `× (1/√64)` = `× 0.125` | `(B,12,T,T)` | Prevents softmax saturation |
-| **Causal mask** | `.masked_fill(mask==0, -inf)` | `(B,12,T,T)` | Upper triangle → -inf (can't attend to future) |
-| **Softmax** | `F.softmax(dim=-1)` | `(B,12,T,T)` | Each row sums to 1 (attention weights) |
+| **QKᵀ** | `q @ k.transpose(-2,-1)` | `(B,12,T,64) @ (B,12,64,T)` = `(B,12,T,T)` | Computes raw attention scores for each query token against every key token. |
+| **Scale** | `× (1/√64)` = `× 0.125` | `(B,12,T,T)` | Scales down the dot products to prevent softmax from becoming too sharp. |
+| **Causal mask** | `.masked_fill(mask==0, -inf)` | `(B,12,T,T)` | Sets future positions to -inf, so a token cannot attend to later tokens. This enforces causal attention. |
+| **Softmax** | `F.softmax(dim=-1)` | `(B,12,T,T)` | Converts scores into attention probabilities. Each row sums to 1. |
 | **Dropout** | `attn_dropout` | `(B,12,T,T)` | Regularization during training |
-| **Weighted sum** | `att @ v` | `(B,12,T,T) @ (B,12,T,64)` = `(B,12,T,64)` | Output per head |
+| **Weighted sum** | `att @ v` | `(B,12,T,T) @ (B,12,T,64)` = `(B,12,T,64)` | Uses the attention weights to compute a weighted sum of the value vectors, gathering information from the tokens the model attends to. |
 
 The causal mask is a lower-triangular matrix created at init:
 

@@ -57,7 +57,7 @@ class CausalSelfAttention(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # c_attn: (B, T, C) -> (B, T, 3C), then split into 3 x (B, T, C)
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        # reshape + transpose: (B, T, C) -> (B, T, nh, hs) -> (B, nh, T, hs)
+        # reshape + transpose into multiple attention heads: (B, T, C) -> (B, T, nh, hs) -> (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -74,7 +74,7 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)                                     # (B, nh, T, T)
             att = self.attn_dropout(att)                                     # (B, nh, T, T)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        # (B, nh, T, hs) -> (B, T, nh, hs) -> (B, T, C)
+        # Recombine Heads: (B, nh, T, hs) -> (B, T, nh, hs) -> (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # output projection: (B, T, C) -> (B, T, C)
@@ -110,8 +110,9 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        # x: (B, T, C) -> output: (B, T, C)
+        # x: (B (batch size), T (sequence length), C (embedding dimension)) -> output: (B, T, C)
         # Residual connections around both sub-layers for stable gradient flow
+        # Attention internally changes shapes but returns the same shape as input 
         x = x + self.attn(self.ln_1(x))  # (B, T, C) -> LN -> attn -> (B, T, C), then add residual
         x = x + self.mlp(self.ln_2(x))   # (B, T, C) -> LN -> MLP -> (B, T, C), then add residual
         return x
