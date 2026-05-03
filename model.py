@@ -68,7 +68,8 @@ class CausalSelfAttention(nn.Module):
             # y: (B, nh, T, hs)
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
-            # manual implementation of attention
+            # Scaled dot-product attention: softmax(QK^T / sqrt(d_k)) V
+            # from "Attention Is All You Need" (Vaswani et al., 2017), with causal mask
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))  # (B, nh, T, T)
             att = F.softmax(att, dim=-1)                                     # (B, nh, T, T)
@@ -136,8 +137,8 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd), # word token embeddings
+            wpe = nn.Embedding(config.block_size, config.n_embd), # position embeddings
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -181,17 +182,18 @@ class GPT(nn.Module):
 
     # Forward pass
     def forward(self, idx, targets=None):
+        # idx: (B, T) - batch of token index sequences
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # (B, T) -> (B, T, C)
-        pos_emb = self.transformer.wpe(pos) # (T,)   -> (T, C), broadcast to (B, T, C)
-        x = self.transformer.drop(tok_emb + pos_emb) # (B, T, C)
+        tok_emb = self.transformer.wte(idx) # (B, T) -> (B, T, C) -> token embeddings
+        pos_emb = self.transformer.wpe(pos) # (T,)   -> (T, C), broadcast to (B, T, C) -> position embeddings
+        x = self.transformer.drop(tok_emb + pos_emb) # (B, T, C) -> token embeddings + position embeddings -> (B, T, C) -> dropout
         for block in self.transformer.h:
-            x = block(x)                    # (B, T, C) -> (B, T, C), repeated n_layer times
+            x = block(x)                    # (B, T, C) -> (B, T, C) -> attention and MLP -> (B, T, C) -> repeated n_layer times
         
         # Up to this point, we have B sequences of length T, each with a C-dimensional embedding. These are the final contextualized token representations.
         # Each token vector now contains information about:
